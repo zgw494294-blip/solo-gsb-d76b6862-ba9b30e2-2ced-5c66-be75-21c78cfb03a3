@@ -11,6 +11,12 @@ the two. Likewise a package is sealed, released, claimed or purged either
 fully before or fully after a replacement — a release can never be recorded
 under a stale generation, and a claim can never serve data whose release
 generation the registry has already moved past.
+
+Each committed registry replacement and each sample purge that actually
+cleared packages is appended to the committed-operation log in the same
+transaction as the business change itself, so the log can be paged through
+``GET /api/operations`` for an exact, restart-proof trace of what took
+effect, in the order it took effect.
 """
 
 from __future__ import annotations
@@ -89,6 +95,26 @@ class StaleGeneration(Exception):
         )
         self.expected = expected
         self.current = current
+
+
+class UntilSeqNotCommitted(Exception):
+    """The requested log cutoff exceeds the committed maximum seq (HTTP 400)."""
+
+    def __init__(self, until_seq: int, committed_seq: int):
+        super().__init__(
+            f"until_seq {until_seq} exceeds the highest committed operation "
+            f"seq {committed_seq}"
+        )
+        self.until_seq = until_seq
+        self.committed_seq = committed_seq
+
+
+def _sorted_columns(pairs) -> list[dict[str, str]]:
+    """Source columns as ``{"source", "column"}`` sorted by (source, column)."""
+    return [
+        {"source": source_id, "column": column_name}
+        for source_id, column_name in sorted(pairs)
+    ]
 
 
 def _registry_snapshot() -> tuple[frozenset[tuple[str, str]], int]:
@@ -349,7 +375,14 @@ def purge_packages(columns: list[tuple[str, str]]) -> dict[str, object]:
 
         purged.sort()
         if purged:
-            db.purge_packages(purged)
+            # Only a purge that actually cleared packages is recorded; the
+            # record commits together with the purge itself.
+            operation = {
+                "generation": db.get_generation(),
+                "columns": _sorted_columns(targets),
+                "purged": purged,
+            }
+            db.purge_packages(purged, operation)
         return {"purged": purged}
 
 
@@ -371,16 +404,27 @@ def replace_registry(
     """Replace the whole registry and re-review every registered graph.
 
     Stale ``expected_generation`` is rejected as :class:`StaleGeneration`
-    without touching anything. Otherwise every registered graph is re-reviewed
-    under the OR of its in-graph flags and the new entries, and entries, the
-    generation increment and all new conclusions are committed in one
-    transaction; any failure rolls the whole replacement back.
+    without touching anything — and without leaving a log record. Otherwise
+    every registered graph is re-reviewed under the OR of its in-graph flags
+    and the new entries, and entries, the generation increment, all new
+    conclusions and the operation record are committed in one transaction;
+    any failure rolls the whole replacement back. A replacement is recorded
+    even when the new entries are identical to the old ones.
     """
     db = get_store()
     with db.lock:
         current = db.get_generation()
         if expected_generation != current:
             raise StaleGeneration(expected_generation, current)
+
+        old_entries = set(db.get_entries())
+        new_entries = set(entries)
+        operation = {
+            "generation_before": current,
+            "generation_after": current + 1,
+            "added": _sorted_columns(new_entries - old_entries),
+            "removed": _sorted_columns(old_entries - new_entries),
+        }
 
         extra_sensitive = frozenset(entries)
         new_reviews: dict[str, dict[str, object]] = {}
@@ -391,8 +435,9 @@ def replace_registry(
             new_reviews[row["id"]] = run_review(request, extra_sensitive)
 
         next_generation = current + 1
-        # Entries, generation and conclusions commit together or not at all.
-        db.replace_entries(entries, next_generation, new_reviews)
+        # Entries, generation, conclusions and the log record commit together
+        # or not at all.
+        db.replace_entries(entries, next_generation, new_reviews, operation)
         return {
             "generation": next_generation,
             "entries": [
@@ -400,6 +445,43 @@ def replace_registry(
                 for source_id, column_name in entries
             ],
             "reviews": {graph_id: review for graph_id, review in new_reviews.items()},
+        }
+
+
+# ---------------------------------------------------------------------------
+# Committed-operation log
+# ---------------------------------------------------------------------------
+
+
+def list_operations(
+    after_seq: int, limit: int, until_seq: int | None
+) -> dict[str, object]:
+    """Page the committed-operation log in ascending seq order.
+
+    The page holds the committed records with ``after_seq < seq <= cutoff``
+    where the cutoff is the explicitly requested ``until_seq`` or, when it is
+    omitted, the highest committed seq (0 on an empty log). An explicit
+    cutoff beyond that maximum is rejected as :class:`UntilSeqNotCommitted`
+    (HTTP 400). ``next_after_seq`` is the seq of the page's last record — or
+    ``after_seq`` itself when the page is empty — so paging with a fixed
+    cutoff never mixes in operations committed after it.
+    """
+    db = get_store()
+    with db.lock:
+        committed = db.max_operation_seq()
+        if until_seq is not None and until_seq > committed:
+            raise UntilSeqNotCommitted(until_seq, committed)
+        cutoff = committed if until_seq is None else until_seq
+        records: list[dict[str, object]] = []
+        for row in db.list_operation_rows(after_seq, cutoff, limit):
+            record: dict[str, object] = {"seq": row["seq"], "type": row["type"]}
+            record.update(json.loads(row["payload"]))
+            records.append(record)
+        next_after_seq = records[-1]["seq"] if records else after_seq
+        return {
+            "until_seq": cutoff,
+            "records": records,
+            "next_after_seq": next_after_seq,
         }
 
 

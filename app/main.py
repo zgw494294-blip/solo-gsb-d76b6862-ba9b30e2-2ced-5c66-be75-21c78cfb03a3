@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Annotated
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import registry
@@ -67,9 +68,13 @@ app = FastAPI(
         "on a listed column (by the original content and row-influence "
         "rules, ignoring sensitivity marks) loses its stored rows and "
         "release record and stays purged for good — release and claim then "
-        "answer 410."
+        "answer 410. Every committed registry replacement and every purge "
+        "that actually cleared packages is appended to a committed-operation "
+        "log (one shared, ever-increasing seq per operation, stored in the "
+        "same transaction as the change itself) that can be paged through "
+        "GET /api/operations."
     ),
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -251,6 +256,28 @@ async def purge_sealed_packages(request: PackagePurgeRequest) -> object:
 @app.get("/api/sensitive-columns")
 async def read_sensitive_columns() -> dict[str, object]:
     return registry.get_registry()
+
+
+@app.get("/api/operations")
+async def list_committed_operations(
+    after_seq: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    until_seq: Annotated[int | None, Query(ge=0)] = None,
+) -> object:
+    try:
+        return registry.list_operations(after_seq, limit, until_seq)
+    except registry.UntilSeqNotCommitted as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "UNTIL_SEQ_NOT_COMMITTED",
+                    "message": str(exc),
+                    "until_seq": exc.until_seq,
+                    "committed_seq": exc.committed_seq,
+                }
+            },
+        )
 
 
 @app.put("/api/sensitive-columns")

@@ -1,6 +1,6 @@
 """SQLite-backed persistence for graphs, the shared registry and packages.
 
-Three pieces of state survive restarts:
+Four pieces of state survive restarts:
 
 * the shared sensitive-column registry (entries keyed by ``(source, column)``)
   together with its monotonically increasing ``generation`` (0 on a fresh
@@ -13,16 +13,25 @@ Three pieces of state survive restarts:
   package was created under, and — once released — the ``release_generation``
   the package was released under (NULL while unreleased). A package purged
   by source column keeps its id but loses its ``rows`` and release record
-  and carries a persistent ``purged`` marker.
+  and carries a persistent ``purged`` marker;
+* the committed-operation log: one record per committed registry replacement
+  or sample purge, carrying a ``type`` and a positive ``seq`` shared by both
+  types and assigned in the order the operations take effect. Records hold
+  only metadata (generations, source columns, package ids) — never samples
+  or whole graphs. A database written by an older release simply starts
+  with an empty log.
 
 All reads and writes of the in-process state go through one lock, and a
-replacement persists the new entries, the new generation and every graph's new
-review result in a single explicit SQLite transaction: either the whole change
-commits or nothing at all changes, so a registry can never be observed
-together with stale conclusions — not even after a write or commit failure,
-and not after the database is reopened. Sealing a package and recording its
-release are likewise single atomic writes: a failed write or commit never
-leaves a new package or a new release record behind.
+replacement persists the new entries, the new generation, every graph's new
+review result and the operation record in a single explicit SQLite
+transaction: either the whole change commits or nothing at all changes, so a
+registry can never be observed together with stale conclusions — not even
+after a write or commit failure, and not after the database is reopened.
+Sealing a package and recording its release are likewise single atomic
+writes: a failed write or commit never leaves a new package or a new release
+record behind. A purge commits the cleared packages together with its
+operation record the same way, and a purge that matched nothing is never
+recorded at all.
 """
 
 from __future__ import annotations
@@ -66,6 +75,11 @@ CREATE TABLE IF NOT EXISTS packages (
     generation INTEGER NOT NULL,
     release_generation INTEGER,
     purged INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS operations (
+    seq INTEGER PRIMARY KEY,
+    type TEXT NOT NULL,
+    payload TEXT NOT NULL
 );
 """
 
@@ -175,15 +189,18 @@ class Store:
         entries: list[tuple[str, str]],
         generation: int,
         graph_reviews: dict[str, dict[str, object]],
+        operation: dict[str, object],
     ) -> None:
-        """Persist entries + generation + every graph's review atomically.
+        """Persist entries + generation + reviews + the log record atomically.
 
         ``graph_reviews`` maps every registered graph id to its review under
-        the *new* registry. The caller has already computed the reviews, so
-        the transaction itself never runs review logic. Any write or commit
-        failure rolls the whole replacement back: entries, generation and
-        every stored conclusion stay exactly as they were — including after
-        the database is closed and reopened.
+        the *new* registry; ``operation`` is the replacement's log payload
+        (generations before/after and the added/removed source columns). The
+        caller has already computed the reviews and the payload, so the
+        transaction itself never runs review logic. Any write or commit
+        failure rolls the whole replacement back: entries, generation, every
+        stored conclusion and the operation log stay exactly as they were —
+        including after the database is closed and reopened.
         """
         with self._transaction():
             self._conn.execute("DELETE FROM sensitive_entries")
@@ -202,6 +219,7 @@ class Store:
                     "WHERE id = ?",
                     (json.dumps(review, ensure_ascii=False), generation, graph_id),
                 )
+            self._append_operation("replace", operation)
 
     # ------------------------------------------------------------- graphs --
 
@@ -303,15 +321,20 @@ class Store:
                 (release_generation, package_id),
             )
 
-    def purge_packages(self, package_ids: list[str]) -> None:
+    def purge_packages(
+        self, package_ids: list[str], operation: dict[str, object]
+    ) -> None:
         """Mark packages purged, dropping their rows and release records.
 
         Every listed package is updated in one explicit transaction: the
         sealed ``rows`` are discarded, the release record is cleared and the
-        persistent ``purged`` marker is set. A failed write or commit rolls
-        the whole batch back — no package is left half-purged. The graph,
-        the registry and the generation are never touched, and no attempt is
-        made to scrub SQLite free pages or WAL remnants.
+        persistent ``purged`` marker is set; ``operation`` (the purge's log
+        payload: current generation, requested source columns and the purged
+        package ids) is appended to the operation log in the same
+        transaction. A failed write or commit rolls the whole batch back —
+        no package is left half-purged and no record is left behind. The
+        graph, the registry and the generation are never touched, and no
+        attempt is made to scrub SQLite free pages or WAL remnants.
         """
         with self._transaction():
             self._conn.executemany(
@@ -319,6 +342,41 @@ class Store:
                 "purged = 1 WHERE id = ?",
                 [(package_id,) for package_id in package_ids],
             )
+            self._append_operation("purge", operation)
+
+    # ---------------------------------------------------------- operations --
+
+    def _append_operation(self, op_type: str, payload: dict[str, object]) -> int:
+        """Append one committed-operation record; the caller holds the transaction.
+
+        Registry replacements and sample purges share one sequence of
+        positive integer seqs assigned in the order the operations take
+        effect (commit order under the store lock), so the record commits —
+        or rolls back — together with the business change it describes.
+        """
+        next_seq = self.max_operation_seq() + 1
+        self._conn.execute(
+            "INSERT INTO operations (seq, type, payload) VALUES (?, ?, ?)",
+            (next_seq, op_type, json.dumps(payload, ensure_ascii=False)),
+        )
+        return next_seq
+
+    def max_operation_seq(self) -> int:
+        """The highest committed operation seq (0 when the log is empty)."""
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS seq FROM operations"
+        ).fetchone()
+        return int(row["seq"])
+
+    def list_operation_rows(
+        self, after_seq: int, until_seq: int, limit: int
+    ) -> list[sqlite3.Row]:
+        """Committed records with ``after_seq < seq <= until_seq``, ascending."""
+        return self._conn.execute(
+            "SELECT seq, type, payload FROM operations "
+            "WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?",
+            (after_seq, until_seq, limit),
+        ).fetchall()
 
 
 # The shared process-wide store, created lazily so importing the app never
