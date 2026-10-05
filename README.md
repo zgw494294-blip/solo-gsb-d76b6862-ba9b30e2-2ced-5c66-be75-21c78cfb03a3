@@ -52,6 +52,12 @@
 在 SQLite 中保存的 `rows` 与放行记录清除并**持久标记为已清除**——已清除包的放行、领取入口
 均返回 410，名录恢复安全或重启也不能恢复，详见下文“按源列清除已封存样本”。
 
+最后，**成功生效的名录替换与样本清除**都会追加一条只含元数据的**审计记录**：两类操作共用
+一条按生效顺序递增的正整数 `seq`，替换记录前后 generation 与增删的源列，清除记录当前
+generation、请求源列与实际清除的包 ID；记录**不含任何样本或整图**，与业务变化在同一事务
+写入 SQLite（写入或提交失败两者都不变；过期请求与空匹配清除不留记录）。`GET /api/audit-log`
+按 `seq` 升序翻页追溯，截止固定后翻页不会混入后续操作，详见下文“名录替换与样本清除审计日志”。
+
 ## 风险传播规则
 
 | 节点 | 行为 | 内容影响 | 行影响 |
@@ -91,9 +97,9 @@ schema 问题判为 422。
 
 > 端口：**8080**
 >
-> 登记图、共用敏感列名录与待放行导出包保存在容器内 `/data/export-risk.db`（SQLite），该目录
-> 挂载在 Compose **命名卷** `export-risk-data` 上，`docker compose down`（不带 `-v`）与容器
-> 重启后数据仍在。
+> 登记图、共用敏感列名录、待放行导出包与名录替换/样本清除审计日志保存在容器内
+> `/data/export-risk.db`（SQLite），该目录挂载在 Compose **命名卷** `export-risk-data` 上，
+> `docker compose down`（不带 `-v`）与容器重启后数据仍在。
 
 ```bash
 docker compose up --build
@@ -1135,13 +1141,14 @@ curl -s -i -X POST http://localhost:8080/api/compare \
   条目**互异**（重复为 422），**可以指向尚未登记（任何图都没有）的来源或列**——此时不产生影响；
 * **OR 语义**：某源列只要被图内 `sensitive: true` **或**名录命中，即按敏感处理，二者取并集；
 * **代次（generation）**：名录初始为空、generation 为 `0`；成功整份替换一次加一；
-* **随名录变化**：名录替换成功后，服务**重审全部登记图**，并把**名录、代次和每张图的新结论
-  在同一事务里一起保存**；写入中途或提交失败都会**整体回滚**——名录、代次与全部结论保持
-  旧值，重开数据库后也不变，故障解除后可用原 `expected_generation` 重试，
+* **随名录变化**：名录替换成功后，服务**重审全部登记图**，并把**名录、代次、每张图的新结论
+  与一条审计记录在同一事务里一起保存**；写入中途或提交失败都会**整体回滚**——名录、代次、
+  全部结论与审计记录保持旧值，重开数据库后也不变，故障解除后可用原 `expected_generation` 重试，
   见下文“替换失败：整体回滚与重试”；
-* **持久化**：登记图、名录、代次、审查结论与导出包（含放行记录）保存在 SQLite（默认
-  `data/export-risk.db`，可用环境变量 `RISK_API_DB` 覆盖）；Docker 部署时数据库位于
-  Compose **命名卷**上，容器重启后登记图、名录与导出包仍然可用。
+* **持久化**：登记图、名录、代次、审查结论、导出包（含放行记录）与审计日志保存在 SQLite
+  （默认 `data/export-risk.db`，可用环境变量 `RISK_API_DB` 覆盖）；Docker 部署时数据库位于
+  Compose **命名卷**上，容器重启后登记图、名录、导出包与审计记录仍然可用。**旧版数据库升级后
+  审计日志从空开始**（不回填历史），之后的操作正常记 `seq=1、2、…`。
 
 旧接口 `/api/review`、`/api/preview`、`/api/revise`、`/api/prune`、`/api/rename`、
 `/api/compose`、`/api/compare` 的行为**完全不变**：它们只按请求图内的 `sensitive` 标记审查，
@@ -1155,7 +1162,8 @@ curl -s -i -X POST http://localhost:8080/api/compare \
 | `GET` | `/api/graphs/{id}` | 读取登记图：返回**原始 `nodes`/`export`**、当前 `generation`（结论所对应的代次）与该代次下的 `review`；未知 ID 返回 **404** `GRAPH_NOT_FOUND` |
 | `POST` | `/api/graphs/{id}/preview` | 按图 ID 预演，请求体**只含 `rows`、`conditions`**（形状与规则同 `/api/preview`）。复用全部原预演规则（覆盖、键集合、标量、200 行上限等）；放行以**当前审查结论**为准：阻断时返回 **400** `PREVIEW_BLOCKED`，错误体**不含任何样本数据**；成功返回样本并带当前 `generation`；未知 ID 返回 **404** `GRAPH_NOT_FOUND` |
 | `GET` | `/api/sensitive-columns` | 读取当前名录：`{"generation": N, "entries": [...]}`（条目按提交顺序） |
-| `PUT` | `/api/sensitive-columns` | **整份替换**名录：`{"entries": [...], "expected_generation": N}`，条目互异、可空（清空）。`expected_generation` 与当前代次不符时返回 **409** `GENERATION_CONFLICT`（带 `expected_generation`/`current_generation`），不做任何修改；成功时代次加一、重审全部登记图，并返回新代次、新名录与每张图的新结论 `reviews`（按图 ID）；写库异常返回 **500** `INTERNAL`，名录、代次与结论全部保持旧值 |
+| `PUT` | `/api/sensitive-columns` | **整份替换**名录：`{"entries": [...], "expected_generation": N}`，条目互异、可空（清空）。`expected_generation` 与当前代次不符时返回 **409** `GENERATION_CONFLICT`（带 `expected_generation`/`current_generation`），不做任何修改、**也不留审计记录**；成功时代次加一、重审全部登记图，并返回新代次、新名录与每张图的新结论 `reviews`（按图 ID）；同一事务还追加一条**审计记录**（前后代次与增删源列，内容完全相同也记一条）；写库异常返回 **500** `INTERNAL`，名录、代次、结论与审计记录全部保持旧值。审计日志读取见 `GET /api/audit-log` |
+| `GET` | `/api/audit-log` | **翻页读取审计日志**：查询参数 `after_seq`（非负，默认 0）、`limit`（1～100，默认 50）、`until_seq`（可选非负）。返回固定截止 `until_seq`、按 `seq` 升序的 `after_seq < seq ≤ until_seq` 记录与 `next_cursor`（末条 seq，空页沿用 `after_seq`）；省略截止时取已提交最大 seq（空库为 0），显式截止超过该值返回 **400** `UNTIL_SEQ_OUT_OF_RANGE`（带 `until_seq`/`max_seq`）；参数越界为 **422** |
 
 ### 并发次序
 
@@ -1354,7 +1362,7 @@ curl -s -X PUT http://localhost:8080/api/sensitive-columns \
 | `POST` | `/api/graphs/{id}/packages` | **封存**：请求体与按 ID 预演完全同构（只含 `rows`、`conditions`），沿用**当前名录**与全部原预演规则（覆盖、键集合、标量、200 行上限等）。仅当审查**安全**时把 `columns`、`rows` 与**创建代次**存入 SQLite，返回 **201** 且响应体**只含包 `id` 与创建 `generation`**；输入错误（400 原错误码）或阻断（400 `PREVIEW_BLOCKED`，不含样本）都**不建包**；未知图 ID 返回 **404** `GRAPH_NOT_FOUND` |
 | `POST` | `/api/packages/{id}/release` | **放行**：请求体 `{"expected_generation": N}`。`N` 与当前代次不符（过期）返回 **409** `GENERATION_CONFLICT`（带 `expected_generation`/`current_generation`），什么都不记；随后按**当前名录**重审该图，阻断时返回 **400** `RELEASE_BLOCKED`（带 `review`，不含样本）且**不放行**；成功则把**当前代次**保存为**放行代次**，响应体**只含包 `id` 与 `release_generation`**。名录变更后可再次放行（覆盖旧放行代次）；已清除的包返回 **410** `PACKAGE_PURGED`；未知包 ID 返回 **404** `PACKAGE_NOT_FOUND` |
 | `GET` | `/api/packages/{id}` | **领取**：**不重算**，直接返回封存的 `columns`/`rows`、图 ID `graph_id`、创建代次 `generation` 与放行代次 `release_generation`。**未放行**或**放行代次不等于当前代次**时返回 **409** `PACKAGE_NOT_RELEASED`（带 `release_generation`/`current_generation`），响应**不含任何样本**；已清除的包返回 **410** `PACKAGE_PURGED`；未知包 ID 返回 **404** `PACKAGE_NOT_FOUND` |
-| `POST` | `/api/packages/purge` | **按源列清除**：请求体 `{"columns": [{"source": "...", "column": "..."}, ...]}`（非空、组合互异）。按原内容来源与行影响规则（不受敏感标记限制）判断导出是否依赖任一指定列，清除依赖包保存的 `rows` 与放行记录并持久标记为已清除，返回本次清除的包 ID 列表（按 ID 排序，未匹配为空列表），详见下文“按源列清除已封存样本” |
+| `POST` | `/api/packages/purge` | **按源列清除**：请求体 `{"columns": [{"source": "...", "column": "..."}, ...]}`（非空、组合互异）。按原内容来源与行影响规则（不受敏感标记限制）判断导出是否依赖任一指定列，清除依赖包保存的 `rows` 与放行记录并持久标记为已清除，返回本次清除的包 ID 列表（按 ID 排序，未匹配为空列表、**不留审计记录**）；有实际清除时在同一事务追加一条审计记录（当前 generation、请求源列、实际清除包 ID），详见下文“按源列清除已封存样本” |
 
 规则要点：
 
@@ -1543,8 +1551,11 @@ curl -s -X PUT http://localhost:8080/api/sensitive-columns \
 * 导出依赖任一指定列时，该图**此次操作生效前已存在**的全部未清除包都被清除：SQLite 中
   保存的 `rows` 与放行记录被删除，包被**持久标记为已清除**；**后续新封存的包不受影响**。
 * 图、敏感名录与 generation 一律不变；其他包与旧接口行为不变。
-* 整个清除在**同一事务**中提交，任何写入或提交失败都整批不变（500 `INTERNAL`）；清除与
-  封存、放行、领取共用同一把锁，按同一先后次序整体生效。
+* 有实际清除时，清除与一条**审计记录**（当前 generation、按 `(source, column)` 排序的请求源列、
+  按 ID 排序的实际清除包 ID）在**同一事务**中提交；任何写入或提交失败都整批不变（500
+  `INTERNAL`）——包不被半清除、审计记录也不留；清除与封存、放行、领取共用同一把锁，按同一
+  先后次序整体生效，两类审计操作因此共用一条连续 `seq`。
+* **空匹配清除不记**：本次没有清除任何包时不写任何数据，也不追加审计记录。
 * 不要求擦除 SQLite 空闲页或 WAL 残留字节。
 
 成功响应为本次清除的包 ID 列表（按 ID 排序；一个包只列一次，已清除的包不重复列出；
@@ -1605,6 +1616,123 @@ curl -s -X POST http://localhost:8080/api/packages/purge \
 # {"purged":[]}
 ```
 
+## 名录替换与样本清除审计日志：GET /api/audit-log
+
+**成功生效**的两类操作各追加一条审计记录，供 HTTP API 追溯：
+
+* 名录整份**替换**（`PUT /api/sensitive-columns` 成功）；
+* 已封存样本按源列**清除**（`POST /api/packages/purge` 实际清除了至少一个包）。
+
+### 记录内容与编号
+
+* 两类操作**共用一条**按**生效顺序**递增的正整数 `seq`（1、2、3、…），与替换/清除共用
+  进程级锁的总次序一致；`seq` 只增不回收，失败与过期不占号。
+* **替换记录**：`type` 为 `"replace"`，带
+  * `generation_before` / `generation_after`：替换前后的名录代次；
+  * `added` / `removed`：相对旧名录**新增 / 删除**的源列，各为
+    `{"source": ..., "column": ...}` 列表，按 `(source, column)` 排序。
+  * **内容完全相同的替换仍记一条**（generation 照常加一，`added`/`removed` 均为空）。
+* **清除记录**：`type` 为 `"purge"`，带
+  * `generation`：清除生效时的**当前**名录 generation（清除本身不改代次）；
+  * `columns`：**请求**中的源列，按 `(source, column)` 排序；
+  * `package_ids`：**实际清除**的包 ID，按 ID 排序（已清除过的包不会再次出现）。
+* 记录**不含样本数据（rows）也不含整图定义**；登记、封存、放行、领取等其他操作不记。
+* **不记的情形**：过期 generation 的替换（409）、schema/参数错误（422）、图阻断类 400、
+  **空匹配清除**（返回 `{"purged":[]}`）都不追加记录。
+
+### 与业务变化同事务、重启保留
+
+审计记录与它描述的业务变化在**同一个 SQLite 显式事务**中提交：替换时名录、代次、全部新结论
+与审计行要么全部生效、要么全部回滚；清除时包更新与审计行同理。任何写入或提交失败（500
+`INTERNAL`）都不会出现“业务变了没记录”或“记了录业务没变”，重开数据库后也一致。记录随数据库
+文件持久化，**重启（容器重建、`docker compose down` 不带 `-v`）后保留**，`seq` 延续。
+**旧版数据库升级后从空日志开始**：启动时自动建表、不回填升级前的历史，升级后的第一条记录
+为 `seq=1`。
+
+### 查询参数
+
+`GET /api/audit-log` 的查询参数：
+
+| 参数 | 约束 | 默认 | 含义 |
+|---|---|---|---|
+| `after_seq` | 非负整数 | `0` | 只取 `seq > after_seq` 的记录（游标） |
+| `limit` | 整数 **1～100** | `50` | 本页最多返回条数 |
+| `until_seq` | 非负整数，可省略 | 已提交最大 seq | **截止**：只取 `seq ≤ until_seq` |
+
+* 省略 `until_seq` 时，截止取**当前已提交的最大 seq**（空库为 `0`）；
+* **显式 `until_seq` 超过已提交最大 seq 时拒绝**整次请求：**400**
+  `UNTIL_SEQ_OUT_OF_RANGE`，错误体带 `until_seq` 与 `max_seq`（空库只接受 `0`）；
+* `after_seq` 为负、`limit` 超出 1～100、`until_seq` 为负或非整数等为 schema 问题，返回 **422**。
+
+### 响应与固定截止翻页
+
+响应体：
+
+```json
+{
+  "until_seq": 5,
+  "records": [
+    {"seq": 1, "type": "replace",
+     "generation_before": 0, "generation_after": 1,
+     "added": [{"source": "users", "column": "email"}], "removed": []},
+    {"seq": 2, "type": "purge",
+     "generation": 1,
+     "columns": [{"source": "users", "column": "email"}],
+     "package_ids": ["31430ac1..."]}
+  ],
+  "next_cursor": 2
+}
+```
+
+* `records` 按 `seq` **升序**，窗口为 `after_seq < seq ≤ until_seq`；
+* `next_cursor` 为本页**末条记录的 seq**；**空页沿用 `after_seq`**；
+* 用同一个显式 `until_seq` 翻页时，窗口上界固定，**不会混入截止之后新提交的操作**——即使期间
+  又发生了替换或清除，带着原截止重放仍只看到当时已提交的记录。省略 `until_seq` 则每一页都以
+  请求时刻的最新 seq 为截止。
+
+### curl：写入（替换 / 清除）
+
+```bash
+# 成功替换 -> 追加一条 replace 审计记录（内容相同也记；过期 expected_generation 不记）
+curl -s -X PUT http://localhost:8080/api/sensitive-columns \
+  -H 'Content-Type: application/json' \
+  -d '{"entries": [{"source": "users", "column": "email"}],
+       "expected_generation": 0}'
+# {"generation":1,"entries":[...],"reviews":{...}}
+
+# 实际清除 -> 追加一条 purge 审计记录；未匹配任何包时不记
+curl -s -X POST http://localhost:8080/api/packages/purge \
+  -H 'Content-Type: application/json' \
+  -d '{"columns": [{"source": "users", "column": "email"}]}'
+# {"purged":["<PID>"]}
+```
+
+### curl：翻页读取
+
+```bash
+# 首页：省略 until_seq，截止取当前最大 seq，默认每页 50 条
+curl -s 'http://localhost:8080/api/audit-log'
+# {"until_seq":2,"records":[{"seq":1,"type":"replace",...},
+#   {"seq":2,"type":"purge",...}],"next_cursor":2}
+
+# 固定截止 2、每页 1 条，逐页推进（期间的新操作不会混入）
+curl -s 'http://localhost:8080/api/audit-log?after_seq=0&limit=1&until_seq=2'
+# {"until_seq":2,"records":[{"seq":1,...}],"next_cursor":1}
+curl -s 'http://localhost:8080/api/audit-log?after_seq=1&limit=1&until_seq=2'
+# {"until_seq":2,"records":[{"seq":2,...}],"next_cursor":2}
+curl -s 'http://localhost:8080/api/audit-log?after_seq=2&limit=1&until_seq=2'
+# {"until_seq":2,"records":[],"next_cursor":2}      # 空页沿用 after_seq
+
+# 显式截止超过已提交最大 seq：400
+curl -s -i 'http://localhost:8080/api/audit-log?until_seq=99'
+# HTTP/1.1 400 ... {"error":{"code":"UNTIL_SEQ_OUT_OF_RANGE",
+#   "message":"...","until_seq":99,"max_seq":2}}
+
+# 空库：截止与下一游标均为 0
+curl -s 'http://localhost:8080/api/audit-log'
+# {"until_seq":0,"records":[],"next_cursor":0}
+```
+
 ## 节点 JSON 结构
 
 ```jsonc
@@ -1642,11 +1770,11 @@ python -m pytest tests/ -q
 ```
 app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest、PreviewRequest、CompareRequest，以及 GraphRegisterRequest、GraphPreviewRequest、SensitiveColumnsReplaceRequest、PackageReleaseRequest、PackagePurgeRequest）
 app/engine.py     图校验、拓扑排序、来源传播（图内标记 ∪ 名录的 OR 敏感集）、逐列审查、安全修订、按列精简、源列批量改名、上下游拼接、小样本预演、两版导出风险对照，以及不受敏感标记限制的导出源列依赖判定
-app/registry.py   登记图/按图预演/名录读取与整份替换，导出包封存/放行/领取，以及按源列清除已封存样本：锁内取快照、重审全部登记图、世代冲突
-app/storage.py    SQLite 持久化（名录与 generation、登记图原图与审查结论、导出包与放行代次及已清除标记；替换与结论在同一显式事务提交，写入/提交失败整体回滚）
-app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/api/compare、/api/graphs、/api/graphs/{id}、/api/graphs/{id}/preview、/api/graphs/{id}/packages、/api/packages/{id}/release、/api/packages/{id}、/api/packages/purge、/api/sensitive-columns、/health）
+app/registry.py   登记图/按图预演/名录读取与整份替换，导出包封存/放行/领取，按源列清除已封存样本，以及审计日志翻页读取：锁内取快照、重审全部登记图、世代冲突、固定截止游标
+app/storage.py    SQLite 持久化（名录与 generation、登记图原图与审查结论、导出包与放行代次及已清除标记、两类操作共用 seq 的审计日志；替换/清除与其审计行在同一显式事务提交，写入/提交失败整体回滚；旧库打开时建空审计表）
+app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/api/compare、/api/graphs、/api/graphs/{id}、/api/graphs/{id}/preview、/api/graphs/{id}/packages、/api/packages/{id}/release、/api/packages/{id}、/api/packages/purge、/api/sensitive-columns、/api/audit-log、/health）
 examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、preview_request.json、compare_request.json）
-tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演、两版对照，登记图/名录/代次/并发次序/替换失败回滚/SQLite 持久化，导出包封存/放行/领取/失败不留痕，以及按源列清除已封存样本测试
+tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演、两版对照，登记图/名录/代次/并发次序/替换失败回滚/SQLite 持久化，导出包封存/放行/领取/失败不留痕，按源列清除已封存样本，以及名录替换/样本清除审计日志的记录内容、翻页、固定截止、重启保留、旧库空日志与同事务回滚测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排（命名卷 export-risk-data 持久化 /data/export-risk.db）
 ```

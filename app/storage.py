@@ -13,16 +13,25 @@ Three pieces of state survive restarts:
   package was created under, and — once released — the ``release_generation``
   the package was released under (NULL while unreleased). A package purged
   by source column keeps its id but loses its ``rows`` and release record
-  and carries a persistent ``purged`` marker.
+  and carries a persistent ``purged`` marker;
+* the append-only audit log of committed registry replacements and sample
+  purges: each entry carries the effect-order ``seq`` shared by both kinds,
+  its ``type`` and a payload describing the change (never the samples
+  themselves). A log row is written in the *same* transaction as the change
+  it describes, so a failed write or commit leaves neither the business
+  change nor a log entry behind.
 
 All reads and writes of the in-process state go through one lock, and a
-replacement persists the new entries, the new generation and every graph's new
-review result in a single explicit SQLite transaction: either the whole change
-commits or nothing at all changes, so a registry can never be observed
-together with stale conclusions — not even after a write or commit failure,
-and not after the database is reopened. Sealing a package and recording its
-release are likewise single atomic writes: a failed write or commit never
-leaves a new package or a new release record behind.
+replacement persists the new entries, the new generation, every graph's new
+review result and its audit-log row in a single explicit SQLite transaction:
+either the whole change commits or nothing at all changes, so a registry can
+never be observed together with stale conclusions — not even after a write or
+commit failure, and not after the database is reopened. Sealing a package and
+recording its release are likewise single atomic writes: a failed write or
+commit never leaves a new package or a new release record behind. A purge
+commits its package updates together with its audit-log row the same way.
+A database written by an older release simply starts with an empty log: the
+audit table is created on open and nothing is backfilled.
 """
 
 from __future__ import annotations
@@ -66,6 +75,11 @@ CREATE TABLE IF NOT EXISTS packages (
     generation INTEGER NOT NULL,
     release_generation INTEGER,
     purged INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+    seq INTEGER PRIMARY KEY,
+    type TEXT NOT NULL,
+    payload TEXT NOT NULL
 );
 """
 
@@ -175,15 +189,19 @@ class Store:
         entries: list[tuple[str, str]],
         generation: int,
         graph_reviews: dict[str, dict[str, object]],
+        audit_payload: dict[str, object],
     ) -> None:
-        """Persist entries + generation + every graph's review atomically.
+        """Persist entries + generation + reviews + audit row atomically.
 
         ``graph_reviews`` maps every registered graph id to its review under
         the *new* registry. The caller has already computed the reviews, so
-        the transaction itself never runs review logic. Any write or commit
-        failure rolls the whole replacement back: entries, generation and
-        every stored conclusion stay exactly as they were — including after
-        the database is closed and reopened.
+        the transaction itself never runs review logic. The audit-log row
+        describing the replacement (old/new generation and the added/removed
+        source columns) is assigned the next shared seq and committed in the
+        same transaction. Any write or commit failure rolls the whole
+        replacement back: entries, generation, every stored conclusion and
+        the log row stay exactly as they were — including after the database
+        is closed and reopened.
         """
         with self._transaction():
             self._conn.execute("DELETE FROM sensitive_entries")
@@ -202,6 +220,7 @@ class Store:
                     "WHERE id = ?",
                     (json.dumps(review, ensure_ascii=False), generation, graph_id),
                 )
+            self._insert_audit("replace", audit_payload)
 
     # ------------------------------------------------------------- graphs --
 
@@ -303,15 +322,22 @@ class Store:
                 (release_generation, package_id),
             )
 
-    def purge_packages(self, package_ids: list[str]) -> None:
+    def purge_packages(
+        self,
+        package_ids: list[str],
+        audit_payload: dict[str, object],
+    ) -> None:
         """Mark packages purged, dropping their rows and release records.
 
-        Every listed package is updated in one explicit transaction: the
-        sealed ``rows`` are discarded, the release record is cleared and the
-        persistent ``purged`` marker is set. A failed write or commit rolls
-        the whole batch back — no package is left half-purged. The graph,
-        the registry and the generation are never touched, and no attempt is
-        made to scrub SQLite free pages or WAL remnants.
+        Every listed package is updated and the audit-log row describing the
+        purge is inserted in one explicit transaction: the sealed ``rows``
+        are discarded, the release record is cleared and the persistent
+        ``purged`` marker is set, while the log records the current
+        generation, the requested source columns and the actually purged
+        package ids. A failed write or commit rolls the whole batch back — no
+        package is left half-purged and no log row survives a failed purge.
+        The graph, the registry and the generation are never touched, and no
+        attempt is made to scrub SQLite free pages or WAL remnants.
         """
         with self._transaction():
             self._conn.executemany(
@@ -319,6 +345,51 @@ class Store:
                 "purged = 1 WHERE id = ?",
                 [(package_id,) for package_id in package_ids],
             )
+            self._insert_audit("purge", audit_payload)
+
+    # ------------------------------------------------------------ audit log --
+
+    def max_audit_seq(self) -> int:
+        """Largest committed audit seq, or 0 while the log is empty."""
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS m FROM audit_log"
+        ).fetchone()
+        return int(row["m"])
+
+    def list_audit_rows(
+        self, after_seq: int, until_seq: int, limit: int
+    ) -> list[dict[str, object]]:
+        """Return ``after_seq < seq <= until_seq`` rows, seq ascending.
+
+        At most ``limit`` rows are returned. Each row is decoded into
+        ``{"seq", "type", ...payload fields}``.
+        """
+        rows = self._conn.execute(
+            "SELECT seq, type, payload FROM audit_log "
+            "WHERE seq > ? AND seq <= ? ORDER BY seq ASC LIMIT ?",
+            (after_seq, until_seq, limit),
+        ).fetchall()
+        records: list[dict[str, object]] = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            records.append({"seq": row["seq"], "type": row["type"], **payload})
+        return records
+
+    def _insert_audit(self, entry_type: str, payload: dict[str, object]) -> int:
+        """Append one audit row with the next shared, effect-order seq.
+
+        Callers serialize under the process-wide lock (and call this inside
+        the business transaction), so ``MAX(seq) + 1`` is exactly the order
+        the committed operations take effect in.
+        """
+        next_seq = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM audit_log"
+        ).fetchone()[0]
+        self._conn.execute(
+            "INSERT INTO audit_log (seq, type, payload) VALUES (?, ?, ?)",
+            (next_seq, entry_type, json.dumps(payload, ensure_ascii=False)),
+        )
+        return next_seq
 
 
 # The shared process-wide store, created lazily so importing the app never

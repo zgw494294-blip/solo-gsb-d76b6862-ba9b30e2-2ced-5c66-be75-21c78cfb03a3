@@ -306,6 +306,13 @@ def claim_package(package_id: str) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
+def _source_columns(pairs: set[tuple[str, str]] | frozenset[tuple[str, str]]):
+    return [
+        {"source": source_id, "column": column_name}
+        for source_id, column_name in sorted(pairs)
+    ]
+
+
 def purge_packages(columns: list[tuple[str, str]]) -> dict[str, object]:
     """Purge every live package whose export depends on a listed column.
 
@@ -321,10 +328,13 @@ def purge_packages(columns: list[tuple[str, str]]) -> dict[str, object]:
     Only packages that already exist when this operation takes effect are
     considered; packages sealed afterwards are unaffected. Packages already
     purged are never listed again, and a purge that matches nothing changes
-    nothing. The graph, the shared registry and the generation are never
-    touched. The whole batch commits in one transaction under the same lock
-    as seal/release/claim, so a failed write or commit leaves every package
-    exactly as it was.
+    nothing — and, because it changes nothing, leaves no audit record. The
+    graph, the shared registry and the generation are never touched. A
+    matching purge commits its package updates together with one audit row
+    (current generation, requested source columns sorted by
+    ``(source, column)`` and the actually purged package ids sorted) under
+    the same lock as seal/release/claim, so a failed write or commit leaves
+    every package and the log exactly as they were.
     """
     db = get_store()
     targets = frozenset(columns)
@@ -349,7 +359,12 @@ def purge_packages(columns: list[tuple[str, str]]) -> dict[str, object]:
 
         purged.sort()
         if purged:
-            db.purge_packages(purged)
+            audit_payload = {
+                "generation": db.get_generation(),
+                "columns": _source_columns(targets),
+                "package_ids": purged,
+            }
+            db.purge_packages(purged, audit_payload)
         return {"purged": purged}
 
 
@@ -371,10 +386,15 @@ def replace_registry(
     """Replace the whole registry and re-review every registered graph.
 
     Stale ``expected_generation`` is rejected as :class:`StaleGeneration`
-    without touching anything. Otherwise every registered graph is re-reviewed
-    under the OR of its in-graph flags and the new entries, and entries, the
-    generation increment and all new conclusions are committed in one
-    transaction; any failure rolls the whole replacement back.
+    without touching anything and without leaving an audit record. Otherwise
+    every registered graph is re-reviewed under the OR of its in-graph flags
+    and the new entries, and entries, the generation increment, all new
+    conclusions and one audit-log row are committed in one transaction; any
+    failure rolls the whole replacement back. The audit row records the old
+    and new generation plus the source columns the replacement adds and
+    removes (each sorted by ``(source, column)``) — a replacement whose
+    contents are identical to the current list still changes the generation
+    and is still recorded, with empty added/removed lists.
     """
     db = get_store()
     with db.lock:
@@ -382,7 +402,9 @@ def replace_registry(
         if expected_generation != current:
             raise StaleGeneration(expected_generation, current)
 
-        extra_sensitive = frozenset(entries)
+        old_entries = frozenset(db.get_entries())
+        new_entries = frozenset(entries)
+        extra_sensitive = new_entries
         new_reviews: dict[str, dict[str, object]] = {}
         for row in db.list_graph_rows():
             request = ReviewRequest.model_validate(
@@ -391,8 +413,15 @@ def replace_registry(
             new_reviews[row["id"]] = run_review(request, extra_sensitive)
 
         next_generation = current + 1
-        # Entries, generation and conclusions commit together or not at all.
-        db.replace_entries(entries, next_generation, new_reviews)
+        audit_payload = {
+            "generation_before": current,
+            "generation_after": next_generation,
+            "added": _source_columns(new_entries - old_entries),
+            "removed": _source_columns(old_entries - new_entries),
+        }
+        # Entries, generation, conclusions and the audit row commit together
+        # or not at all.
+        db.replace_entries(entries, next_generation, new_reviews, audit_payload)
         return {
             "generation": next_generation,
             "entries": [
@@ -400,6 +429,49 @@ def replace_registry(
                 for source_id, column_name in entries
             ],
             "reviews": {graph_id: review for graph_id, review in new_reviews.items()},
+        }
+
+
+class UntilSeqOutOfRange(Exception):
+    """An explicit ``until_seq`` exceeds the largest committed seq (HTTP 400)."""
+
+    def __init__(self, until_seq: int, max_seq: int):
+        super().__init__(
+            f"until_seq {until_seq} is larger than the latest committed "
+            f"seq {max_seq}"
+        )
+        self.until_seq = until_seq
+        self.max_seq = max_seq
+
+
+def read_audit_log(
+    after_seq: int, limit: int, until_seq: int | None = None
+) -> dict[str, object]:
+    """Return one page of the committed audit log, seq ascending.
+
+    The page covers ``after_seq < seq <= until_seq``; when ``until_seq`` is
+    omitted the cutoff defaults to the largest committed seq (0 on an empty
+    log), and an explicit cutoff above that value is rejected as
+    :class:`UntilSeqOutOfRange` so a fixed cutoff can never silently include
+    operations committed later. The cutoff is echoed back alongside the
+    records and the next cursor — the last returned seq, or ``after_seq``
+    itself when the page is empty.
+    """
+    db = get_store()
+    with db.lock:
+        max_seq = db.max_audit_seq()
+        if until_seq is None:
+            cutoff = max_seq
+        elif until_seq > max_seq:
+            raise UntilSeqOutOfRange(until_seq, max_seq)
+        else:
+            cutoff = until_seq
+        records = db.list_audit_rows(after_seq, cutoff, limit)
+        next_cursor = records[-1]["seq"] if records else after_seq
+        return {
+            "until_seq": cutoff,
+            "records": records,
+            "next_cursor": next_cursor,
         }
 
 

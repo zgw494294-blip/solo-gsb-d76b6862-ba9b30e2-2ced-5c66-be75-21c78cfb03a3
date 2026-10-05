@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import registry
@@ -67,9 +67,12 @@ app = FastAPI(
         "on a listed column (by the original content and row-influence "
         "rules, ignoring sensitivity marks) loses its stored rows and "
         "release record and stays purged for good — release and claim then "
-        "answer 410."
+        "answer 410. Committed registry replacements and sample purges are "
+        "appended to a seq-ordered audit log (stored in the same SQLite "
+        "database, in the same transactions as the changes they describe) "
+        "that can be paged through via GET /api/audit-log."
     ),
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -269,6 +272,35 @@ async def replace_sensitive_columns(
                     "message": str(exc),
                     "expected_generation": exc.expected,
                     "current_generation": exc.current,
+                }
+            },
+        )
+
+
+@app.get("/api/audit-log")
+async def read_audit_log(
+    after_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    until_seq: int | None = Query(default=None, ge=0),
+) -> object:
+    """Page through committed registry replacements and sample purges.
+
+    Both operation kinds share one increasing ``seq`` in effect order. The
+    page covers ``after_seq < seq <= until_seq`` (ascending); omitting
+    ``until_seq`` pins the cutoff to the latest committed seq, while an
+    explicit cutoff past that value is rejected as 400.
+    """
+    try:
+        return registry.read_audit_log(after_seq, limit, until_seq)
+    except registry.UntilSeqOutOfRange as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "UNTIL_SEQ_OUT_OF_RANGE",
+                    "message": str(exc),
+                    "until_seq": exc.until_seq,
+                    "max_seq": exc.max_seq,
                 }
             },
         )
